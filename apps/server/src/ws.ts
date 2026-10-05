@@ -3153,8 +3153,8 @@ const makeWsRpcLayer = (
             deletePendingAttachment(input.attachmentId),
             { "rpc.aggregate": "workspace" },
           ),
-        [WS_METHODS.agentSessionsScan]: () =>
-          observeRpcEffect(WS_METHODS.agentSessionsScan, agentSessionScanner.scan, {
+        [WS_METHODS.agentSessionsScan]: (input) =>
+          observeRpcEffect(WS_METHODS.agentSessionsScan, agentSessionScanner.scanProjects(input), {
             "rpc.aggregate": "workspace",
           }),
         [WS_METHODS.agentSessionsImport]: (input) =>
@@ -3162,6 +3162,22 @@ const makeWsRpcLayer = (
             WS_METHODS.agentSessionsImport,
             agentSessionImporter.importRecentAgentThreads(input),
             { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.agentSessionsListCodex]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.agentSessionsListCodex,
+            agentSessionImporter.listCodexThreads(input),
+            {
+              "rpc.aggregate": "workspace",
+            },
+          ),
+        [WS_METHODS.agentSessionsImportCodex]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.agentSessionsImportCodex,
+            agentSessionImporter.importCodexThreads(input),
+            {
+              "rpc.aggregate": "workspace",
+            },
           ),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(

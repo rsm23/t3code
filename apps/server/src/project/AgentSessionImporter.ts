@@ -8,14 +8,19 @@ import {
   AgentSessionImportSource,
   AgentSessionScanError,
   AgentSessionSource,
+  CommandId,
   EventId,
   MessageId,
-  ProjectId,
   ProviderDriverKind,
   ThreadId,
   TurnItemId,
   type AgentSessionImportInput,
   type AgentSessionImportResult,
+  type CodexSessionImportInput,
+  type CodexSessionImportResult,
+  type CodexSessionListInput,
+  type CodexSessionListResult,
+  type CodexSessionRef,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
@@ -30,10 +35,11 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Semaphore from "effect/Semaphore";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "../orchestration-v2/IdAllocator.ts";
-import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import * as ProjectService from "./ProjectService.ts";
@@ -57,28 +63,6 @@ class AgentSessionUnresumableSessionError extends Schema.TaggedError<AgentSessio
 ) {
   override get message(): string {
     return `Session '${this.providerSessionId}' from '${this.source}' cannot be resumed.`;
-  }
-}
-
-class AgentSessionThreadProjectConflictError extends Schema.TaggedError<AgentSessionThreadProjectConflictError>()(
-  "AgentSessionThreadProjectConflictError",
-  {
-    threadId: ThreadId,
-    expectedProjectId: ProjectId,
-    actualProjectId: ProjectId,
-  },
-) {
-  override get message(): string {
-    return `Imported thread '${this.threadId}' belongs to project '${this.actualProjectId}', not '${this.expectedProjectId}'.`;
-  }
-}
-
-class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThreadModifiedError>()(
-  "AgentSessionThreadModifiedError",
-  { threadId: ThreadId },
-) {
-  override get message(): string {
-    return `Imported thread '${this.threadId}' already contains non-imported activity.`;
   }
 }
 
@@ -165,15 +149,43 @@ function messageEvents(input: {
   ];
 }
 
+export class AgentSessionImporter extends Context.Service<
+  AgentSessionImporter,
+  {
+    readonly importRecentAgentThreads: (
+      input: AgentSessionImportInput,
+    ) => Effect.Effect<
+      AgentSessionImportResult,
+      | AgentSessionScanError
+      | AgentSessionImportProjectNotFoundError
+      | AgentSessionImportProjectChangedError
+    >;
+    readonly listCodexThreads: (
+      input: CodexSessionListInput,
+    ) => Effect.Effect<CodexSessionListResult, AgentSessionScanError>;
+    readonly importCodexThreads: (
+      input: CodexSessionImportInput,
+    ) => Effect.Effect<
+      CodexSessionImportResult,
+      | AgentSessionScanError
+      | AgentSessionImportProjectNotFoundError
+      | AgentSessionImportProjectChangedError
+    >;
+  }
+>()("t3/project/AgentSessionImporter") {}
+
 const make = Effect.gen(function* () {
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const importLock = yield* Semaphore.make(1);
   const projects = yield* ProjectService.ProjectService;
   const eventSink = yield* EventSink.EventSinkV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-  const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
+  const importThreads = Effect.fn("AgentSessionImporter.importThreads")(function* (
     input: AgentSessionImportInput,
+    selectedSessions?: ReadonlyArray<CodexSessionRef>,
+    allCodex = false,
   ) {
     const project = yield* projects.getById(input.projectId).pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
@@ -211,14 +223,38 @@ const make = Effect.gen(function* () {
       }
       return payload.value.importedTranscripts ?? [];
     });
-    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
+    const nativeBindings = yield* projections
+      .getNativeThreadBindings(ProviderDriverKind.make("codex"))
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      );
+    const existingNativeIds = new Set(nativeBindings.map((binding) => binding.nativeId));
+    const existingSessions =
+      selectedSessions?.filter((session) => existingNativeIds.has(session.providerSessionId)) ?? [];
+    const missingSessions = selectedSessions?.filter(
+      (session) => !existingNativeIds.has(session.providerSessionId),
+    );
+    const outcomes =
+      allCodex || missingSessions !== undefined
+        ? scanner.selectedCodexThreads(project.workspaceRoot, missingSessions, existingNativeIds)
+        : scanner.recentThreads(project.workspaceRoot, completedSources);
+    const succeeded = new Set<string>();
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
     let skippedCount = 0;
+    let failedCount = 0;
+    let existingCount = existingSessions.length;
 
     yield* Stream.runForEach(outcomes, (outcome) =>
       Effect.gen(function* () {
+        if (outcome._tag === "Existing") {
+          existingCount += 1;
+          return;
+        }
         if (outcome._tag === "Skipped") {
+          failedCount += 1;
           skippedCount += 1;
           return;
         }
@@ -249,20 +285,25 @@ const make = Effect.gen(function* () {
               providerSessionId: thread.providerSessionId,
             });
           }
-          const existing = yield* Effect.option(orchestrator.getThreadRecords(threadId, []));
+          if (thread.source === "codex" && existingNativeIds.has(thread.providerSessionId)) {
+            if (selectedSessions !== undefined || allCodex) {
+              succeeded.add(`${thread.providerInstanceId}\0${thread.providerSessionId}`);
+              existingCount += 1;
+            }
+            return false;
+          }
+          const existing = yield* projections.getThread(threadId).pipe(
+            Effect.map(Option.some),
+            Effect.catchTag("ProjectionStoreThreadNotFoundError", () =>
+              Effect.succeed(Option.none()),
+            ),
+          );
           if (Option.isSome(existing)) {
-            if (existing.value.thread.projectId !== input.projectId) {
-              return yield* new AgentSessionThreadProjectConflictError({
-                threadId,
-                expectedProjectId: input.projectId,
-                actualProjectId: existing.value.thread.projectId,
-              });
+            if (selectedSessions !== undefined || allCodex) {
+              succeeded.add(`${thread.providerInstanceId}\0${thread.providerSessionId}`);
+              existingCount += 1;
             }
-            if (existing.value.thread.historyOrigin !== "v1_import") {
-              return yield* new AgentSessionThreadModifiedError({ threadId });
-            }
-            yield* runtimes.recordImportedTranscript({ threadId, source });
-            return true;
+            return false;
           }
 
           const driver = ProviderDriverKind.make(thread.source);
@@ -270,6 +311,7 @@ const make = Effect.gen(function* () {
           const providerThreadId = idAllocator.derive.providerThread({
             driver,
             nativeThreadId: thread.providerSessionId,
+            providerInstanceId: thread.providerInstanceId,
           });
           const createdAt = dateTime(thread.createdAt);
           const updatedAt = dateTime(thread.updatedAt);
@@ -373,18 +415,30 @@ const make = Effect.gen(function* () {
               },
             ],
           });
-          yield* runtimes.recordImportedTranscript({ threadId, source });
+          yield* runtimes.recordImportedTranscript({ threadId, source }).pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not record imported transcript identity", {
+                threadId,
+                cause,
+              }),
+            ),
+          );
+          if (thread.source === "codex") existingNativeIds.add(thread.providerSessionId);
           return true;
         }).pipe(
-          Effect.catch((cause) =>
-            Effect.logWarning("Could not import an agent session", {
+          Effect.catch((cause) => {
+            failedCount += 1;
+            return Effect.logWarning("Could not import an agent session", {
               provider: outcome.thread.source,
               sessionId: outcome.thread.providerSessionId,
               cause,
-            }).pipe(Effect.as(false)),
-          ),
+            }).pipe(Effect.as(false));
+          }),
         );
         if (imported) {
+          succeeded.add(
+            `${outcome.thread.providerInstanceId}\0${outcome.thread.providerSessionId}`,
+          );
           importedThreadIds.add(threadId);
           importedCount += 1;
         } else {
@@ -393,17 +447,100 @@ const make = Effect.gen(function* () {
       }),
     );
 
-    return { importedCount, skippedCount } satisfies AgentSessionImportResult;
+    return {
+      importedCount,
+      skippedCount,
+      existingCount,
+      failedCount:
+        selectedSessions === undefined
+          ? failedCount
+          : (missingSessions ?? []).filter(
+              (session) =>
+                !succeeded.has(`${session.providerInstanceId}\0${session.providerSessionId}`),
+            ).length,
+      failedSessions: (missingSessions ?? []).filter(
+        (session) => !succeeded.has(`${session.providerInstanceId}\0${session.providerSessionId}`),
+      ),
+    };
   });
 
-  return { importRecentAgentThreads };
+  const importRecentAgentThreads = (input: AgentSessionImportInput) =>
+    importThreads(input).pipe(
+      importLock.withPermits(1),
+      Effect.map(({ importedCount, skippedCount }): AgentSessionImportResult => ({
+        importedCount,
+        skippedCount,
+      })),
+    );
+  const importCodexThreads = Effect.fn("AgentSessionImporter.importCodexThreads")(function* (
+    input: CodexSessionImportInput,
+  ) {
+    let projectId = input.projectId;
+    if (input.createProject !== undefined) {
+      const created = yield* projects
+        .bootstrap({
+          commandId: CommandId.make(`codex-import:project:${input.projectId}`),
+          projectId: input.projectId,
+          title: input.createProject.title,
+          workspaceRoot: input.createProject.workspaceRoot,
+          createWorkspaceRootIfMissing: false,
+        })
+        .pipe(
+          Effect.catchTag("ProjectConflictError", (error) =>
+            projects
+              .getById(error.conflictingProjectId)
+              .pipe(
+                Effect.flatMap((existing) =>
+                  Option.isSome(existing)
+                    ? Effect.succeed({ project: existing.value, created: false })
+                    : Effect.fail(error),
+                ),
+              ),
+          ),
+          Effect.mapError(
+            (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+          ),
+        );
+      projectId = created.project.id;
+    }
+    const result = yield* importThreads(
+      { ...input, projectId },
+      input.sessions,
+      input.sessions === undefined,
+    );
+    return {
+      projectId,
+      importedCount: result.importedCount,
+      existingCount: result.existingCount,
+      failedSessions: result.failedSessions,
+      failedCount: result.failedCount,
+    } satisfies CodexSessionImportResult;
+  }, importLock.withPermits(1));
+  const listCodexThreads = Effect.fn("AgentSessionImporter.listCodexThreads")(function* (
+    input: CodexSessionListInput,
+  ) {
+    const listed = yield* scanner.listCodexThreads(input);
+    const bindings = yield* projections
+      .getNativeThreadBindings(ProviderDriverKind.make("codex"))
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      );
+    const byNativeId = new Map(bindings.map((binding) => [binding.nativeId, binding.threadId]));
+    return {
+      ...listed,
+      sessions: listed.sessions.map((session) => ({
+        ...session,
+        importedThreadId: byNativeId.get(session.providerSessionId) ?? null,
+      })),
+    };
+  });
+  return AgentSessionImporter.of({
+    importRecentAgentThreads,
+    listCodexThreads,
+    importCodexThreads,
+  });
 });
-
-type AgentSessionImporterShape = Effect.Success<typeof make>;
-
-export class AgentSessionImporter extends Context.Service<
-  AgentSessionImporter,
-  AgentSessionImporterShape
->()("t3/project/AgentSessionImporter") {}
 
 export const layer = Layer.effect(AgentSessionImporter, make);

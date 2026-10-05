@@ -234,6 +234,63 @@ const addOrphanedRecoveryCandidate = Effect.fn("addOrphanedRecoveryCandidate")(f
   return threadId;
 });
 
+it.effect(
+  "reads native conversation bindings without losing archived or deleted thread ownership",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("native-bindings");
+      const now = yield* DateTime.now;
+      const providerThread = {
+        id: ProviderThreadId.make("provider-thread:native-bindings"),
+        driver,
+        providerInstanceId,
+        providerSessionId: null,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver,
+          nativeId: "original-codex-conversation",
+          strength: "strong" as const,
+        },
+        nativeConversationHeadRef: null,
+        status: "idle" as const,
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      yield* store.apply({
+        id: EventId.make("event:native-bindings:provider"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: providerThread,
+      });
+      assert.deepEqual(yield* store.getNativeThreadBindings(driver), [
+        { nativeId: "original-codex-conversation", threadId },
+      ]);
+      const thread = yield* store.getThread(threadId);
+      yield* store.apply({
+        id: EventId.make("event:native-bindings:archive"),
+        type: "thread.deleted",
+        threadId,
+        occurredAt: now,
+        payload: { ...thread, archivedAt: now, deletedAt: now },
+      });
+      assert.deepEqual(yield* store.getNativeThreadBindings(driver), [
+        { nativeId: "original-codex-conversation", threadId },
+      ]);
+      assert.deepEqual(
+        yield* store.getNativeThreadBindings(ProviderDriverKind.make("claudeAgent")),
+        [],
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);
+
 it("includes imported runless history when selecting fork context through a run", () => {
   const firstRunId = RunId.make("run:projection-imported-fork:1");
   const secondRunId = RunId.make("run:projection-imported-fork:2");

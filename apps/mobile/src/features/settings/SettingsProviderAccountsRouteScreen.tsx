@@ -1,3 +1,4 @@
+import { CodexImportSection } from "./CodexImportSection";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -35,6 +36,7 @@ export function SettingsProviderAccountsRouteScreen() {
           contentContainerClassName="gap-6 px-5 pt-4"
           contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
         >
+          <CodexImportSection />
           {selectedTargets.length === 0 ? (
             <Text className="text-foreground-muted">Select a connected environment.</Text>
           ) : (

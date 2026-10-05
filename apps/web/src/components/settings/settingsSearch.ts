@@ -161,6 +161,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["name icon emoji image checkout remove delete"],
   },
   {
+    id: "codex-import",
+    title: "Import projects from Codex",
+    to: "/settings/providers",
+    scope: "environment",
+    searchTerms: ["chats threads history existing archived workspace missing"],
+  },
+  {
     id: "default-model",
     title: "Default model",
     to: "/settings/general",

@@ -25,6 +25,28 @@ T3 Code can use your installed Codex and its existing login. Run `codex login`
 on the environment's machine to sign in. [Provider setup](./install.md#providers)
 covers installation and custom configuration.
 
+## Import projects and their threads
+
+Open **Settings → Providers → Import from Codex** on web or desktop, or
+**Settings → Provider accounts → Import from Codex** on mobile. Choose **Import all
+projects** or **Select projects**, then start the import. Each chosen project brings
+its Codex threads, including older and archived history. You can also start from an
+existing project's settings.
+
+T3 Code reuses existing projects and keeps their threads and settings. Conversations
+already present are skipped. Imports copy user and assistant text; tool activity,
+attachments, and checkpoints are not imported. Large or unreadable conversations
+are reported as failures instead of silently cutting their history short.
+
+The picker shows the Codex home it reads on the selected environment. If projects
+are missing, check **Settings → Providers → CODEX_HOME path**. Saved projects with
+an unavailable directory stay visible but cannot be imported. Remote Codex projects
+need a T3 environment connected to their host.
+
+The import does not sync conversations continuously. Replying in an imported thread continues its original
+Codex session, so keep that Codex home available. Removing the thread from T3 Code
+does not delete the original Codex conversation.
+
 ## Use multiple accounts
 
 Add another ChatGPT account in **Settings → Providers**, then select the account

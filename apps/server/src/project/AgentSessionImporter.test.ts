@@ -12,7 +12,7 @@ import * as Stream from "effect/Stream";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "../orchestration-v2/IdAllocator.ts";
-import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as AgentSessionImporter from "./AgentSessionImporter.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
@@ -30,6 +30,9 @@ it.effect("imports messages once and preserves the provider native resume bindin
   let imported = false;
   const scanner = AgentSessionScanner.AgentSessionScanner.of({
     scan: Effect.die("unused"),
+    scanProjects: () => Effect.die("unused"),
+    listCodexThreads: () => Effect.die("unused"),
+    selectedCodexThreads: () => Stream.empty,
     recentThreads: () =>
       Stream.succeed({
         _tag: "Importable",
@@ -69,13 +72,16 @@ it.effect("imports messages once and preserves the provider native resume bindin
               Option.some({ id: projectId, workspaceRoot: "/workspace/project" } as never),
             ),
         }),
-        Layer.mock(Orchestrator.OrchestratorV2)({
-          getThreadRecords: () =>
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getNativeThreadBindings: () => Effect.succeed([]),
+          getThread: () =>
             imported
               ? Effect.succeed({
-                  thread: { id: threadId, projectId, historyOrigin: "v1_import" },
+                  id: threadId,
+                  projectId,
+                  historyOrigin: "v1_import",
                 } as never)
-              : Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId })),
+              : Effect.fail(new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId })),
         }),
         Layer.mock(EventSink.EventSinkV2)({
           write: (input) =>
@@ -102,8 +108,8 @@ it.effect("imports messages once and preserves the provider native resume bindin
       skippedCount: 0,
     });
     expect(yield* importer.importRecentAgentThreads({ projectId })).toEqual({
-      importedCount: 1,
-      skippedCount: 0,
+      importedCount: 0,
+      skippedCount: 1,
     });
 
     expect(writes).toHaveLength(1);
@@ -142,6 +148,6 @@ it.effect("imports messages once and preserves the provider native resume bindin
         resumeCursor: { threadId: providerSessionId },
       }),
     ]);
-    expect(recorded).toHaveLength(2);
+    expect(recorded).toHaveLength(1);
   }).pipe(Effect.provide(testLayer));
 });

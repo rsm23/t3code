@@ -30,6 +30,7 @@ import type {
   RunAttemptId,
   RuntimeRequestId,
   MessageId,
+  ProviderDriverKind,
 } from "@t3tools/contracts";
 import {
   OrchestrationV2AppThreadJson as OrchestrationV2AppThreadJsonSchema,
@@ -122,7 +123,17 @@ export class ProjectionStoreReadError extends Schema.TaggedError<ProjectionStore
   }
 }
 
+export class ProjectionStoreNativeBindingsReadError extends Schema.TaggedError<ProjectionStoreNativeBindingsReadError>()(
+  "ProjectionStoreNativeBindingsReadError",
+  { driver: Schema.String, cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return `Failed to read native conversation bindings for ${this.driver}.`;
+  }
+}
+
 export const ProjectionStoreV2Error = Schema.Union([
+  ProjectionStoreNativeBindingsReadError,
   ProjectionStoreSetupError,
   ProjectionStoreApplyEventError,
   ProjectionStoreThreadNotFoundError,
@@ -307,6 +318,13 @@ export interface ProjectionTimelinePage {
 }
 
 export interface ProjectionStoreV2Shape {
+  /** Native conversation ownership, including archived and deleted threads, without history. */
+  readonly getNativeThreadBindings: (
+    driver: ProviderDriverKind,
+  ) => Effect.Effect<
+    ReadonlyArray<{ readonly nativeId: string; readonly threadId: ThreadId }>,
+    ProjectionStoreV2Error
+  >;
   readonly getThreadAttachmentIds: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<string>, ProjectionStoreV2Error>;
@@ -5534,7 +5552,24 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         )
         .pipe(Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })));
 
+    const getNativeThreadBindings: ProjectionStoreV2Shape["getNativeThreadBindings"] = (driver) =>
+      sql<{ nativeId: string; threadId: string }>`
+        SELECT json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') AS nativeId,
+               provider.thread_id AS threadId
+        FROM orchestration_v2_projection_provider_threads AS provider
+        JOIN orchestration_v2_projection_threads AS thread ON thread.thread_id = provider.thread_id
+        WHERE provider.driver = ${driver}
+          AND json_extract(provider.payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
+        ORDER BY thread.created_at ASC, provider.provider_thread_id ASC
+      `.pipe(
+        Effect.map((rows) =>
+          rows.map((row) => ({ nativeId: row.nativeId, threadId: ThreadId.make(row.threadId) })),
+        ),
+        Effect.mapError((cause) => new ProjectionStoreNativeBindingsReadError({ driver, cause })),
+      );
+
     return {
+      getNativeThreadBindings,
       apply,
       getShellSnapshot,
       getThreadShell,
@@ -5579,6 +5614,18 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
     const sequence = yield* Ref.make(0);
 
     const service: ProjectionStoreV2Shape = {
+      getNativeThreadBindings: (driver) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].flatMap((projection) =>
+              projection.providerThreads.flatMap((thread) =>
+                thread.driver === driver && thread.nativeThreadRef?.nativeId != null
+                  ? [{ nativeId: thread.nativeThreadRef.nativeId, threadId: projection.thread.id }]
+                  : [],
+              ),
+            ),
+          ),
+        ),
       apply: (event) =>
         Effect.gen(function* () {
           const result = yield* Ref.modify(replayState, (existing) => {

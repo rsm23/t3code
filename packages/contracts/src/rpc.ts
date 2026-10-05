@@ -74,6 +74,10 @@ import {
   AgentSessionScanInput,
   AgentSessionScanResult,
   AgentSessionScanError,
+  CodexSessionListInput,
+  CodexSessionListResult,
+  CodexSessionImportInput,
+  CodexSessionImportResult,
 } from "./agentSessions.ts";
 import {
   AssetAccessError,
@@ -357,6 +361,8 @@ export const WS_METHODS = {
   filesystemBrowse: "filesystem.browse",
   agentSessionsScan: "agentSessions.scan",
   agentSessionsImport: "agentSessions.import",
+  agentSessionsListCodex: "agentSessions.listCodex",
+  agentSessionsImportCodex: "agentSessions.importCodex",
   assetsCreateUrl: "assets.createUrl",
   assetsPersistChatAttachments: "assets.persistChatAttachments",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
@@ -1200,6 +1206,23 @@ const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
   ]),
 });
 
+const WsAgentSessionsListCodexRpc = Rpc.make(WS_METHODS.agentSessionsListCodex, {
+  payload: CodexSessionListInput,
+  success: CodexSessionListResult,
+  error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
+});
+
+const WsAgentSessionsImportCodexRpc = Rpc.make(WS_METHODS.agentSessionsImportCodex, {
+  payload: CodexSessionImportInput,
+  success: CodexSessionImportResult,
+  error: Schema.Union([
+    AgentSessionImportProjectChangedError,
+    AgentSessionImportProjectNotFoundError,
+    AgentSessionScanError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
 const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
@@ -1806,6 +1829,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsFilesystemBrowseRpc,
   WsAgentSessionsScanRpc,
   WsAgentSessionsImportRpc,
+  WsAgentSessionsListCodexRpc,
+  WsAgentSessionsImportCodexRpc,
   WsAssetsCreateUrlRpc,
   WsAssetsPersistChatAttachmentsRpc,
   WsAttachmentsCreateUploadUrlRpc,

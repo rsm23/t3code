@@ -205,6 +205,17 @@ export function CommandPalette(props: {
           }),
       },
       {
+        key: "importCodex",
+        kind: "action",
+        title: "Import projects from Codex",
+        searchTerms: ["chats", "threads", "history", "archived", "workspace"],
+        run: () =>
+          navigation.navigate("SettingsSheet", {
+            screen: "SettingsContent",
+            params: { screen: "SettingsProviderAccounts" },
+          }),
+      },
+      {
         key: "appearance",
         kind: "action",
         title: "Appearance",
