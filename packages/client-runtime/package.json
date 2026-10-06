@@ -183,6 +183,14 @@
       "types": "./src/state/preview.ts",
       "default": "./src/state/preview.ts"
     },
+    "./state/agent-sessions": {
+      "types": "./src/state/agentSessions.ts",
+      "default": "./src/state/agentSessions.ts"
+    },
+    "./codex-session-import": {
+      "types": "./src/codexSessionImport.ts",
+      "default": "./src/codexSessionImport.ts"
+    },
     "./state/projects": {
       "types": "./src/state/projects.ts",
       "default": "./src/state/projects.ts"

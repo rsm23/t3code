@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
+import * as NodeSqlite from "node:sqlite";
 import { describe, expect, it } from "@effect/vitest";
 import {
   type OrchestrationProjectShell,
@@ -154,6 +155,418 @@ function makeRecordLimitTranscript(cwd: string, overflow: boolean): string {
 }
 
 it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+  it.effect("shows Codex app projects even when they have no transcript in their root", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const codexHomePath = yield* makeTempDir("t3code-codex-registry-");
+      const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+      const workspace = yield* makeTempDir("t3code-codex-app-project-");
+      yield* fileSystem.writeFileString(
+        path.join(codexHomePath, ".codex-global-state.json"),
+        encodeTranscriptRecord({
+          "local-projects": {
+            "saved-project": {
+              id: "saved-project",
+              name: "My Codex project",
+              rootPaths: [workspace],
+            },
+          },
+          "electron-saved-workspace-roots": [workspace],
+        }),
+      );
+      const result = yield* Effect.gen(function* () {
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+        return yield* scanner.scanProjects({ source: "codex", includeArchived: true });
+      }).pipe(
+        Effect.provide(
+          makeScannerTestLayer({ codexHomePath, claudeHomePath, configBaseDir: workspace }),
+        ),
+      );
+      expect(result.candidates).toEqual([
+        expect.objectContaining({ path: workspace, title: "My Codex project", threadCount: 0 }),
+      ]);
+    }),
+  );
+
+  it.effect(
+    "imports a Codex project's explicitly assigned thread even when its cwd is elsewhere",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const codexHomePath = yield* makeTempDir("t3code-codex-membership-");
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const workspace = yield* makeTempDir("t3code-codex-saved-");
+        const originalCwd = yield* makeTempDir("t3code-codex-original-");
+        yield* fs.writeFileString(
+          path.join(codexHomePath, ".codex-global-state.json"),
+          encodeTranscriptRecord({
+            "local-projects": {
+              saved: { id: "saved", name: "Named project", rootPaths: [workspace] },
+            },
+            "thread-workspace-root-hints": { hinted: workspace },
+            "thread-project-assignments": { native: { projectKind: "local", projectId: "saved" } },
+          }),
+        );
+        yield* writeTranscript({
+          filePath: path.join(
+            codexHomePath,
+            "sessions",
+            "2020",
+            "01",
+            "01",
+            "rollout-assigned.jsonl",
+          ),
+          contents:
+            [
+              encodeTranscriptRecord({
+                type: "session_meta",
+                payload: { id: "native", cwd: originalCwd },
+              }),
+              encodeTranscriptRecord({
+                type: "event_msg",
+                payload: { type: "user_message", message: "Assigned conversation" },
+              }),
+            ].join("\n") + "\n",
+          mtimeMs: Date.parse("2020-01-01T00:00:00Z"),
+        });
+        yield* writeTranscript({
+          filePath: path.join(
+            codexHomePath,
+            "sessions",
+            "2020",
+            "01",
+            "01",
+            "rollout-hinted.jsonl",
+          ),
+          contents:
+            [
+              encodeTranscriptRecord({
+                type: "session_meta",
+                payload: { id: "hinted", cwd: originalCwd },
+              }),
+              encodeTranscriptRecord({
+                type: "event_msg",
+                payload: { type: "user_message", message: "Workspace-root hint" },
+              }),
+            ].join("\n") + "\n",
+          mtimeMs: Date.parse("2020-01-01T00:00:00Z"),
+        });
+        yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          const scan = yield* scanner.scanProjects({ source: "codex", includeArchived: true });
+          expect(scan.candidates).toEqual([
+            expect.objectContaining({ path: workspace, title: "Named project", threadCount: 2 }),
+          ]);
+          const outcomes = yield* scanner.selectedCodexThreads(workspace).pipe(Stream.runCollect);
+          expect(outcomes).toHaveLength(2);
+          expect(outcomes[0]).toMatchObject({
+            _tag: "Importable",
+            thread: { providerSessionId: "native" },
+          });
+          expect(yield* scanner.selectedCodexThreads(originalCwd).pipe(Stream.runCollect)).toEqual(
+            [],
+          );
+        }).pipe(Effect.provide(makeScannerTestLayer({ codexHomePath, claudeHomePath })));
+      }),
+  );
+
+  it.effect(
+    "reads the current Codex SQLite project index and shows unavailable and remote roots",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const codexHomePath = yield* makeTempDir("t3code-codex-index-");
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const workspace = yield* makeTempDir("t3code-codex-index-project-");
+        const missing = path.join(workspace, "removed");
+        const originalCwd = yield* makeTempDir("t3code-codex-db-original-");
+        yield* fs.writeFileString(
+          path.join(codexHomePath, ".codex-global-state.json"),
+          encodeTranscriptRecord({
+            "remote-projects": [
+              { id: "remote", label: "Windows project", remotePath: "C:/Dev/remote" },
+            ],
+          }),
+        );
+        yield* Effect.sync(() => {
+          const db = new NodeSqlite.DatabaseSync(path.join(codexHomePath, "state_5.sqlite"));
+          try {
+            db.exec(
+              "CREATE TABLE projects(id TEXT, name TEXT, position INTEGER); CREATE TABLE project_roots(project_id TEXT, position INTEGER, path TEXT); CREATE TABLE threads(id TEXT, project_id TEXT);",
+            );
+            db.prepare("INSERT INTO projects VALUES(?, ?, ?)").run("saved", "Database project", 0);
+            db.prepare("INSERT INTO project_roots VALUES(?, ?, ?)").run("saved", 0, workspace);
+            db.prepare("INSERT INTO projects VALUES(?, ?, ?)").run("gone", "Removed directory", 1);
+            db.prepare("INSERT INTO threads VALUES(?, ?)").run("db-native", "saved");
+            db.prepare("INSERT INTO project_roots VALUES(?, ?, ?)").run("gone", 0, missing);
+          } finally {
+            db.close();
+          }
+        });
+        yield* writeTranscript({
+          filePath: path.join(
+            codexHomePath,
+            "sessions",
+            "2020",
+            "01",
+            "01",
+            "rollout-db-assigned.jsonl",
+          ),
+          contents:
+            [
+              encodeTranscriptRecord({
+                type: "session_meta",
+                payload: { id: "db-native", cwd: originalCwd },
+              }),
+              encodeTranscriptRecord({
+                type: "event_msg",
+                payload: { type: "user_message", message: "Database membership" },
+              }),
+            ].join("\n") + "\n",
+          mtimeMs: Date.parse("2020-01-01T00:00:00Z"),
+        });
+        const scan = yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          return yield* scanner.scanProjects({ source: "codex", includeArchived: true });
+        }).pipe(Effect.provide(makeScannerTestLayer({ codexHomePath, claudeHomePath })));
+        expect(scan.sourceHomes).toEqual([codexHomePath]);
+        expect(scan.candidates).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ path: workspace, title: "Database project", threadCount: 1 }),
+            expect.objectContaining({
+              path: missing,
+              title: "Removed directory",
+              unavailableReason: "Project directory is unavailable on this environment.",
+            }),
+            expect.objectContaining({
+              path: "C:/Dev/remote",
+              title: "Windows project",
+              unavailableReason: "Remote Codex project. Connect T3 to its host to import.",
+            }),
+          ]),
+        );
+        expect(scan.candidates).toHaveLength(3);
+      }),
+  );
+
+  it.effect(
+    "lists older and archived Codex conversations and imports complete selected history",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const workspace = yield* makeTempDir("t3code-import-workspace-");
+        const otherWorkspace = yield* makeTempDir("t3code-import-other-");
+        const records = (id: string, cwd: string, messages = 1) =>
+          [
+            encodeTranscriptRecord({ type: "session_meta", payload: { id, cwd } }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: "Original prompt" },
+            }),
+            ...Array.from({ length: messages }, (_, index) =>
+              encodeTranscriptRecord({
+                type: "response_item",
+                payload: {
+                  type: "message",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: `Answer ${index}` }],
+                },
+              }),
+            ),
+          ].join("\n") + "\n";
+        const activePath = path.join(
+          codexHomePath,
+          "sessions",
+          "2020",
+          "01",
+          "01",
+          "rollout-older.jsonl",
+        );
+        const archivedPath = path.join(
+          codexHomePath,
+          "archived_sessions",
+          "rollout-archived.jsonl",
+        );
+        const fileSystem = yield* FileSystem.FileSystem;
+        yield* fileSystem.writeFileString(
+          path.join(codexHomePath, "session_index.jsonl"),
+          [
+            encodeTranscriptRecord({ id: "older", thread_name: "My renamed Codex conversation" }),
+            "malformed-index-line",
+          ].join("\n") + "\n",
+        );
+        yield* writeTranscript({
+          filePath: activePath,
+          contents: records("older", workspace, 250),
+          mtimeMs: Date.parse("2020-01-01T00:00:00Z"),
+        });
+        yield* writeTranscript({
+          filePath: archivedPath,
+          contents: records("archived", workspace),
+          mtimeMs: Date.parse("2020-01-02T00:00:00Z"),
+        });
+        yield* writeTranscript({
+          filePath: path.join(codexHomePath, "sessions", "2020", "01", "01", "rollout-other.jsonl"),
+          contents: records("other", otherWorkspace),
+          mtimeMs: Date.parse("2020-01-03T00:00:00Z"),
+        });
+        yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          const active = yield* scanner.listCodexThreads({ workspaceRoot: workspace });
+          expect(active.sessions.map((session) => session.providerSessionId)).toEqual(["older"]);
+          const all = yield* scanner.listCodexThreads({
+            workspaceRoot: workspace,
+            includeArchived: true,
+          });
+          expect(
+            all.sessions.map((session) => [session.providerSessionId, session.archived]),
+          ).toEqual([
+            ["archived", true],
+            ["older", false],
+          ]);
+          expect(all.sessions.map((session) => session.title)).toEqual([
+            "Original prompt",
+            "My renamed Codex conversation",
+          ]);
+          const outcomes = yield* scanner
+            .selectedCodexThreads(workspace, all.sessions)
+            .pipe(Stream.runCollect);
+          const imported = outcomes.filter((outcome) => outcome._tag === "Importable");
+          expect(imported.map((outcome) => outcome.thread.providerSessionId)).toEqual([
+            "archived",
+            "older",
+          ]);
+          expect(imported[1]?.thread.messages).toHaveLength(251);
+          expect(imported[1]?.thread.title).toBe("My renamed Codex conversation");
+          expect(imported[1]?.thread.messages[0]?.text).toBe("Original prompt");
+          expect(imported[1]?.thread.messages.at(-1)?.text).toBe("Answer 249");
+          const allHistory = yield* scanner.selectedCodexThreads(workspace).pipe(Stream.runCollect);
+          expect(allHistory).toEqual(outcomes);
+          const missingHistory = yield* scanner
+            .selectedCodexThreads(workspace, undefined, new Set(["older"]))
+            .pipe(Stream.runCollect);
+          expect(missingHistory.map((outcome) => outcome._tag)).toEqual(["Importable", "Existing"]);
+          const wrongWorkspace = yield* scanner
+            .selectedCodexThreads(otherWorkspace, all.sessions)
+            .pipe(Stream.runCollect);
+          expect(wrongWorkspace).toEqual([]);
+          const forgedPath = yield* scanner
+            .selectedCodexThreads(workspace, [
+              { ...all.sessions[0]!, filePath: "/outside/provider/home.jsonl" },
+            ])
+            .pipe(Stream.runCollect);
+          expect(forgedPath).toEqual([]);
+          yield* Effect.forEach(
+            Array.from({ length: 30 }, (_, index) => index),
+            (index) =>
+              writeTranscript({
+                filePath: path.join(
+                  codexHomePath,
+                  "sessions",
+                  "2020",
+                  "01",
+                  "01",
+                  `rollout-bulk-${index}.jsonl`,
+                ),
+                contents: records(`bulk-${index}`, workspace),
+                mtimeMs: Date.parse("2020-01-04T00:00:00Z") + index,
+              }),
+            { discard: true },
+          );
+          yield* scanner.scanProjects({ source: "codex", includeArchived: true });
+          const bulk = yield* scanner.selectedCodexThreads(workspace).pipe(Stream.runCollect);
+          expect(bulk.filter((outcome) => outcome._tag === "Importable")).toHaveLength(32);
+          expect(
+            bulk.some(
+              (outcome) => outcome._tag === "Importable" && outcome.thread.messages.length === 251,
+            ),
+          ).toBe(true);
+          yield* writeTranscript({
+            filePath: activePath,
+            contents: records("older", otherWorkspace),
+            mtimeMs: Date.parse("2020-01-01T00:00:00Z"),
+          });
+          const changedWorkspace = yield* scanner
+            .selectedCodexThreads(workspace)
+            .pipe(Stream.runCollect);
+          expect(
+            changedWorkspace
+              .filter((outcome) => outcome._tag === "Importable")
+              .map((outcome) => outcome.thread.providerSessionId),
+          ).not.toContain("older");
+          expect(changedWorkspace.some((outcome) => outcome._tag === "Skipped")).toBe(true);
+        }).pipe(
+          Effect.provide(
+            makeScannerTestLayer({
+              codexHomePath,
+              claudeHomePath,
+              importedWorkspaceRoots: [workspace],
+            }),
+          ),
+        );
+      }),
+  );
+
+  it.effect(
+    "pages Codex summaries and discovers archive-only projects without scanning Claude",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const workspace = yield* makeTempDir("t3code-import-workspace-");
+        for (let index = 0; index < 26; index++) {
+          yield* writeTranscript({
+            filePath: path.join(codexHomePath, "archived_sessions", `rollout-${index}.jsonl`),
+            contents:
+              encodeTranscriptRecord({
+                type: "session_meta",
+                payload: { id: `archived-${index}`, cwd: workspace },
+              }) + "\n",
+            mtimeMs: Date.parse("2020-01-01T00:00:00Z") + index * 1000,
+          });
+        }
+        yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          const scan = yield* scanner.scanProjects({ source: "codex", includeArchived: true });
+          expect(scan.candidates).toHaveLength(1);
+          expect(scan.candidates[0]).toMatchObject({
+            path: workspace,
+            projectId: ProjectId.make("project-1"),
+            alreadyImported: true,
+            threadCount: 26,
+            sources: ["codex"],
+          });
+          const page = yield* scanner.listCodexThreads({
+            workspaceRoot: workspace,
+            includeArchived: true,
+          });
+          expect(page.sessions).toHaveLength(25);
+          expect(page.nextCursor).toBe(25);
+          const last = yield* scanner.listCodexThreads({
+            workspaceRoot: workspace,
+            includeArchived: true,
+            cursor: page.nextCursor!,
+          });
+          expect(last.sessions.map((session) => session.providerSessionId)).toEqual(["archived-0"]);
+          expect(last.nextCursor).toBeNull();
+        }).pipe(
+          Effect.provide(
+            makeScannerTestLayer({
+              codexHomePath,
+              claudeHomePath,
+              importedWorkspaceRoots: [workspace],
+            }),
+          ),
+        );
+      }),
+  );
+
   describe("scan", () => {
     it.effect("reads Claude project cwds from transcripts, newest first", () =>
       Effect.gen(function* () {

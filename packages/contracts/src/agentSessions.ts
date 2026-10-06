@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 /** Coding agent home directories the scanner knows how to read. */
@@ -20,11 +26,10 @@ export const AgentSessionImportSource = Schema.Struct({
 });
 export type AgentSessionImportSource = typeof AgentSessionImportSource.Type;
 
-/**
- * Empty for now. Kept as a struct so future scan options (source filters,
- * explicit roots) can be added without a new method.
- */
-export const AgentSessionScanInput = Schema.Struct({});
+export const AgentSessionScanInput = Schema.Struct({
+  source: Schema.optional(AgentSessionSource),
+  includeArchived: Schema.optional(Schema.Boolean),
+});
 export type AgentSessionScanInput = typeof AgentSessionScanInput.Type;
 
 /**
@@ -52,6 +57,7 @@ export const AgentSessionProjectCandidate = Schema.Struct({
   threadCount: NonNegativeInt,
   lastActiveAt: Schema.NullOr(IsoDateTime),
   alreadyImported: Schema.Boolean,
+  unavailableReason: Schema.optional(TrimmedNonEmptyString),
   /**
    * `null` when the directory is not the root of a git repository. Missing on
    * servers that predate the git scan, where the client cannot tell repositories
@@ -64,6 +70,7 @@ export type AgentSessionProjectCandidate = typeof AgentSessionProjectCandidate.T
 export const AgentSessionScanResult = Schema.Struct({
   candidates: Schema.Array(AgentSessionProjectCandidate),
   scannedAt: IsoDateTime,
+  sourceHomes: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   truncated: Schema.optional(Schema.Boolean),
 });
 export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
@@ -97,6 +104,60 @@ export const AgentSessionImportResult = Schema.Struct({
   skippedCount: NonNegativeInt,
 });
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
+
+export const CodexSessionRef = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+  filePath: TrimmedNonEmptyString,
+});
+export type CodexSessionRef = typeof CodexSessionRef.Type;
+
+export const CodexSessionListInput = Schema.Struct({
+  workspaceRoot: TrimmedNonEmptyString,
+  includeArchived: Schema.optional(Schema.Boolean),
+  cursor: Schema.optional(NonNegativeInt),
+});
+export type CodexSessionListInput = typeof CodexSessionListInput.Type;
+
+export const CodexSessionSummary = Schema.Struct({
+  ...CodexSessionRef.fields,
+  title: TrimmedNonEmptyString,
+  updatedAt: IsoDateTime,
+  archived: Schema.Boolean,
+  importedThreadId: Schema.NullOr(ThreadId),
+});
+export type CodexSessionSummary = typeof CodexSessionSummary.Type;
+
+export const CodexSessionListResult = Schema.Struct({
+  sessions: Schema.Array(CodexSessionSummary),
+  nextCursor: Schema.NullOr(NonNegativeInt),
+  truncated: Schema.Boolean,
+});
+export type CodexSessionListResult = typeof CodexSessionListResult.Type;
+
+export const CodexSessionImportInput = Schema.Struct({
+  ...AgentSessionImportInput.fields,
+  createProject: Schema.optional(
+    Schema.Struct({
+      workspaceRoot: TrimmedNonEmptyString,
+      title: TrimmedNonEmptyString,
+    }),
+  ),
+  /** Omit to import every conversation in this project, including archived history. */
+  sessions: Schema.optional(
+    Schema.Array(CodexSessionRef).check(Schema.isMinLength(1), Schema.isMaxLength(25)),
+  ),
+});
+export type CodexSessionImportInput = typeof CodexSessionImportInput.Type;
+
+export const CodexSessionImportResult = Schema.Struct({
+  projectId: ProjectId,
+  importedCount: NonNegativeInt,
+  existingCount: NonNegativeInt,
+  failedSessions: Schema.Array(CodexSessionRef),
+  failedCount: NonNegativeInt,
+});
+export type CodexSessionImportResult = typeof CodexSessionImportResult.Type;
 
 export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(
   "AgentSessionScanError",

@@ -2255,6 +2255,17 @@ function OpenCommandPaletteDialog(props: {
   });
 
   // Target the active thread or draft's project, falling back to the first sidebar group.
+  actionItems.push({
+    kind: "action",
+    value: "action:import-codex",
+    searchTerms: ["import", "codex", "conversations", "chats", "history"],
+    title: "Import projects from Codex",
+    icon: <FolderIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({ to: "/settings/providers", search: {}, hash: "codex-import" });
+    },
+  });
+
   const contextualProjectGroup =
     (contextualProjectRef
       ? projectGroupByTargetKey.get(

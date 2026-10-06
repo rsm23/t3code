@@ -1,3 +1,4 @@
+import { CodexImportSettings } from "./CodexImportSettings";
 import { SettingsGroup } from "./SettingsGroup";
 import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { useAtomValue } from "@effect/atom-react";
@@ -284,6 +285,7 @@ interface ProviderSettingsTarget {
 export function ProviderSettingsPanel(target: ProviderSettingsTarget) {
   return (
     <SettingsPageContainer width="wide" className="@container/providers gap-8">
+      <CodexImportSettings />
       <ProviderSettingsPanelContent
         key={`${target.environmentId ?? ""}:${target.instanceId ?? ""}`}
         {...target}

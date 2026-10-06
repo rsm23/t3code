@@ -224,7 +224,7 @@ const agentSessionImporterProvided = agentSessionImporterLayer.pipe(
     Layer.mergeAll(
       AgentSessionScanner.layer,
       ProjectServiceLayerLive,
-      orchestratorProvided,
+      projectionStoreLayer,
       eventSinkProvided,
       idAllocatorLayer,
       providerSessionRuntimeLayer,
